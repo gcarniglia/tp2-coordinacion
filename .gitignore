@@ -1,0 +1,26 @@
+golang
+
+# Archivos y carpetas que no deben formar parte de la entrega
+# (pueden ser reemplazados durante evaluación)
+**/datasets/
+**/scenarios/
+docker-compose.yaml
+**/Dockerfile
+
+# Cliente completo
+**/src/client/
+
+# Gateway completo excepto message_handler
+**/src/gateway/
+!**/src/gateway/message_handler/
+!**/src/gateway/message_handler/**
+!**/src/gateway/messagehandler/
+!**/src/gateway/messagehandler/**
+
+# Protocolo externo y FruitItem
+**/src/common/message_protocol/external.py
+**/src/common/message_protocol/external_serializer.py
+**/src/common/message_protocol/external/
+**/src/common/messageprotocol/external/
+**/src/common/fruit_item/
+**/src/common/fruititem/
