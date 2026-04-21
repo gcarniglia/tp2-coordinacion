@@ -6,12 +6,17 @@ import signal
 
 from common import middleware, message_protocol, fruit_item
 
+logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s.%(msecs)03d - %(message)s',
+            datefmt='%H:%M:%S'
+        )
+
 ID = int(os.environ["ID"])
 MOM_HOST = os.environ["MOM_HOST"]
 OUTPUT_QUEUE = os.environ["OUTPUT_QUEUE"]
 SUM_AMOUNT = int(os.environ["SUM_AMOUNT"])
 SUM_PREFIX = os.environ["SUM_PREFIX"]
-AGGREGATION_CONTROL_EXCHANGE = "AGGREGATION_CONTROL_EXCHANGE"
 AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
 AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
 TOP_SIZE = int(os.environ["TOP_SIZE"])
@@ -22,12 +27,6 @@ class AggregationFilter:
     def __init__(self):
         self.data_sum_agg_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
             MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{ID}"]
-        )
-
-        self.broadcast_sum_agg_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
-            MOM_HOST,
-            AGGREGATION_CONTROL_EXCHANGE,
-            [f"{AGGREGATION_PREFIX}_{ID}"],
         )
 
         self.agg_join_queue = middleware.MessageMiddlewareQueueRabbitMQ(
@@ -46,7 +45,7 @@ class AggregationFilter:
         self._eof_count_by_client = {}
 
     def _process_data(self, fruit_total, amount, client_id):
-        logging.info("Received data message for client %s and fruit %s with amount %d", client_id, fruit_total, amount)
+        logging.info("Received SUM_AGG_DATA for client %s and fruit %s with amount %d", client_id, fruit_total, amount)
 
         with self._amount_by_fruit_lock:
             client_top_fruits = self.client_amounts_by_fruit.setdefault(client_id, [])
@@ -63,7 +62,7 @@ class AggregationFilter:
             bisect.insort(client_top_fruits, fruit_item.FruitItem(fruit_total, amount))
 
     def _process_eof(self, client_id):
-        logging.info("Received EOF for client %s", client_id)
+        logging.info("Received SUM_AGG_EOF for client %s", client_id)
 
         with self._eof_count_lock:
             eof_count = self._eof_count_by_client.get(client_id, 0) + 1
@@ -102,7 +101,6 @@ class AggregationFilter:
         del self._eof_count_by_client[client_id]
 
     def process_sum_messages(self, message, ack, nack):
-        logging.info("Process message")
         message = message_protocol.internal.deserialize(message)
         match message.type:
             case message_protocol.internal.InternalMessageType.SUM_AGG_DATA:
@@ -120,7 +118,7 @@ class AggregationFilter:
                 return
             self._stopping = True
 
-        for consumer in [self.data_sum_agg_exchange, self.broadcast_sum_agg_exchange]:
+        for consumer in [self.data_sum_agg_exchange]:
             try:
                 consumer.stop_consuming()
             except Exception as e:
@@ -129,7 +127,6 @@ class AggregationFilter:
     def _close_resources(self):
         resources = [
             self.data_sum_agg_exchange,
-            self.broadcast_sum_agg_exchange,
             self.agg_join_queue,
         ]
 
@@ -145,20 +142,12 @@ class AggregationFilter:
             args=(self.process_sum_messages,),
             name="sum-agg-data-consumer-thread",
         )
-        control_thread = threading.Thread(
-            target=self.broadcast_sum_agg_exchange.start_consuming,
-            args=(self.process_sum_messages,),
-            name="sum-agg-control-consumer-thread",
-        )
 
         data_started = False
-        control_started = False
 
         try:
             data_thread.start()
             data_started = True
-            control_thread.start()
-            control_started = True
 
         except Exception:
             self.stop()
@@ -167,8 +156,6 @@ class AggregationFilter:
         finally:
             if data_started:
                 data_thread.join()
-            if control_started:
-                control_thread.join()
             self._close_resources()
 
 

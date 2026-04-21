@@ -5,6 +5,12 @@ import threading
 
 from common import middleware, message_protocol, fruit_item
 
+logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s.%(msecs)03d - %(message)s',
+            datefmt='%H:%M:%S'
+        )
+
 ID = int(os.environ["ID"])
 MOM_HOST = os.environ["MOM_HOST"]
 INPUT_QUEUE = os.environ["INPUT_QUEUE"]
@@ -30,15 +36,14 @@ class SumFilter:
             )
             self.data_sum_agg_exchanges.append(data_sum_agg_exchange)
         
-        self.broadcast_sum_agg_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
-            MOM_HOST, AGGREGATION_CONTROL_EXCHANGE, [f"{AGGREGATION_PREFIX}_{i}" for i in range(AGGREGATION_AMOUNT)]
-            )
 
-        self.sum_control_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
-            MOM_HOST, 
-            SUM_CONTROL_EXCHANGE, 
-            [f"{SUM_PREFIX}_{i}" for i in range(SUM_AMOUNT) if i != ID]
-        )
+
+        if SUM_AMOUNT > 1:
+            self.sum_control_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
+                MOM_HOST, 
+                SUM_CONTROL_EXCHANGE, 
+                [f"{SUM_PREFIX}_{i}" for i in range(SUM_AMOUNT) if i != ID]
+            )
 
         # amount_by_fruit[client_id][fruit] = FruitItem
         self.client_amounts_by_fruit = {}
@@ -47,7 +52,7 @@ class SumFilter:
         self._stopping = False
 
     def _process_data(self, fruit, amount, client_id):
-        logging.info(f"Received data message for client {client_id} and fruit {fruit} with amount {amount}")
+        logging.info(f"Received GAT_SUM_DATA for client {client_id} and fruit {fruit} with amount {amount}")
         with self._amount_by_fruit_lock:
             client_amounts = self.client_amounts_by_fruit.setdefault(client_id, {})
             client_amounts[fruit] = client_amounts.get(
@@ -56,9 +61,12 @@ class SumFilter:
 
 
     def _process_eof(self, client_id):
-        logging.info(f"Received EOF message for client {client_id}")
-        self.sum_control_exchange.send(message_protocol.internal.serialize(message_protocol.internal.InternalMessageType.SUM_SUM_EOF, client_id, None))
-        logging.info(f"Sent SUM_SUM_EOF message for client {client_id} to other sum filters")
+        logging.info(f"Received GAT_SUM_EOF for client {client_id}")
+        
+        if SUM_AMOUNT > 1:
+            self.sum_control_exchange.send(message_protocol.internal.serialize(message_protocol.internal.InternalMessageType.SUM_SUM_EOF, client_id, None))
+            logging.info(f"Sent SUM_SUM_EOF message for client {client_id} to other sum filters")
+        
         self._send_to_aggregators(client_id)
         self._flush_client_data(client_id)
     
@@ -71,7 +79,7 @@ class SumFilter:
         with self._amount_by_fruit_lock:
             client_amounts = self.client_amounts_by_fruit.get(client_id, {})
 
-        logging.info(f"Broadcasting data messages")
+        logging.info(f"Starting to send SUM_AGG_DATA messages for client {client_id} to aggregators")
         for final_fruit_item in client_amounts.values():
             designated_agg = hash(client_id + final_fruit_item.fruit) % AGGREGATION_AMOUNT
             self.data_sum_agg_exchanges[designated_agg].send(
@@ -81,10 +89,20 @@ class SumFilter:
                     [final_fruit_item.fruit, final_fruit_item.amount]
                 )
             )
-            logging.info(f"Sent data message for client {client_id} and fruit {final_fruit_item.fruit} to aggregator {designated_agg}")
+            logging.info(f"Sent SUM_AGG_DATA for client {client_id} and fruit {final_fruit_item.fruit} to aggregator {designated_agg}")
 
-        logging.info(f"Broadcasting EOF message")
-        self.broadcast_sum_agg_exchange.send(message_protocol.internal.serialize(message_protocol.internal.InternalMessageType.SUM_AGG_EOF, client_id, None))
+        self._broadcast_sum_agg_exchange(client_id)
+
+    def _broadcast_sum_agg_exchange(self, client_id):
+        logging.info(f"Broadcasting SUM_AGG_EOF for client {client_id} to all aggregators")
+        for exchange in self.data_sum_agg_exchanges:
+            exchange.send(
+                message_protocol.internal.serialize(
+                    message_protocol.internal.InternalMessageType.SUM_AGG_EOF, 
+                    client_id, 
+                    None
+                )
+            )
 
 
     def process_gateway_messages(self, message, ack, nack):
@@ -122,7 +140,6 @@ class SumFilter:
         resources = [
             self.gat_sum_queue,
             self.sum_control_exchange,
-            self.broadcast_sum_agg_exchange,
             *self.data_sum_agg_exchanges,
         ]
 
@@ -138,11 +155,12 @@ class SumFilter:
             args=(self.process_gateway_messages,),
             name="gateway-consumer-thread",
         )
-        control_thread = threading.Thread(
-            target=self.sum_control_exchange.start_consuming,
-            args=(self.process_sum_control_messages,),
-            name="sum-control-consumer-thread",
-        )
+        if SUM_AMOUNT > 1:
+            control_thread = threading.Thread(
+                target=self.sum_control_exchange.start_consuming,
+                args=(self.process_sum_control_messages,),
+                name="sum-control-consumer-thread",
+            )
 
         gateway_started = False
         control_started = False
@@ -150,8 +168,9 @@ class SumFilter:
         try:
             gateway_thread.start()
             gateway_started = True
-            control_thread.start()
-            control_started = True
+            if SUM_AMOUNT > 1:
+                control_thread.start()
+                control_started = True
 
         except Exception:
             self.stop()

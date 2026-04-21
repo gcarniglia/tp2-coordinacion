@@ -1,7 +1,13 @@
 import uuid
+import logging
 
 from common import message_protocol
 
+logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s.%(msecs)03d - %(message)s',
+            datefmt='%H:%M:%S'
+        )
 
 class MessageHandler:
 
@@ -17,4 +23,5 @@ class MessageHandler:
 
     def deserialize_result_message(self, message):
         internal_message = message_protocol.internal.deserialize(message)
+        logging.info("Client %s received JOIN_GAT message with data %s", internal_message.source_client_uuid, internal_message.data)
         return internal_message.data

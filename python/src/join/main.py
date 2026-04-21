@@ -5,6 +5,12 @@ import signal
 
 from common import middleware, message_protocol, fruit_item
 
+logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s.%(msecs)03d - %(message)s',
+            datefmt='%H:%M:%S'
+        )
+
 MOM_HOST = os.environ["MOM_HOST"]
 INPUT_QUEUE = os.environ["INPUT_QUEUE"]
 OUTPUT_QUEUE = os.environ["OUTPUT_QUEUE"]
