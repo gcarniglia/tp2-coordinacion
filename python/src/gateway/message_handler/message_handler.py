@@ -23,5 +23,19 @@ class MessageHandler:
 
     def deserialize_result_message(self, message):
         internal_message = message_protocol.internal.deserialize(message)
-        logging.info("Client %s received JOIN_GAT message with data %s", internal_message.source_client_uuid, internal_message.data)
+        if (
+            internal_message.type
+            != message_protocol.internal.InternalMessageType.JOIN_GAT_DATA
+        ):
+            return None
+
+        # Only consume the result that belongs to this gateway-side client handler.
+        if internal_message.source_client_uuid != self.client_uuid:
+            return None
+
+        logging.info(
+            "Client %s received JOIN_GAT message with data %s",
+            internal_message.source_client_uuid,
+            internal_message.data,
+        )
         return internal_message.data
