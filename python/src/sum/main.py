@@ -61,6 +61,9 @@ class SumFilter:
         self._aggregator_publish_lock = threading.Lock()
         self._finalized_clients = set()
         self._finalized_clients_lock = threading.Lock()
+        self._client_eof_state_lock = threading.Lock()
+        self._eof_pending_by_client = {}
+        self._inflight_by_client = {}
         self._stop_lock = threading.Lock()
         self._stopping = False
 
@@ -70,6 +73,34 @@ class SumFilter:
                 return False
             self._finalized_clients.add(client_id)
             return True
+
+    def _mark_eof_pending(self, client_id):
+        with self._client_eof_state_lock:
+            self._eof_pending_by_client[client_id] = True
+
+    def _increment_client_inflight(self, client_id):
+        with self._client_eof_state_lock:
+            current = self._inflight_by_client.get(client_id, 0)
+            self._inflight_by_client[client_id] = current + 1
+
+    def _decrement_client_inflight(self, client_id):
+        with self._client_eof_state_lock:
+            current = self._inflight_by_client.get(client_id, 0)
+            if current <= 1:
+                self._inflight_by_client.pop(client_id, None)
+                return
+            self._inflight_by_client[client_id] = current - 1
+
+    def _try_finalize_client(self, client_id):
+        with self._client_eof_state_lock:
+            if not self._eof_pending_by_client.get(client_id, False):
+                return
+            if self._inflight_by_client.get(client_id, 0) != 0:
+                return
+            self._eof_pending_by_client.pop(client_id, None)
+            self._inflight_by_client.pop(client_id, None)
+
+        self._finalize_client(client_id)
 
     def _finalize_client(self, client_id):
         if not self._mark_client_finalized(client_id):
@@ -94,7 +125,8 @@ class SumFilter:
             self.sum_control_producer_exchange.send(message_protocol.internal.serialize(message_protocol.internal.InternalMessageType.SUM_SUM_EOF, client_id, None))
             logging.info(f"Sent SUM_SUM_EOF for client {client_id} to other sum filters")
 
-        self._finalize_client(client_id)
+        self._mark_eof_pending(client_id)
+        self._try_finalize_client(client_id)
     
     def _flush_client_data(self, client_id):
         with self._amount_by_fruit_lock:
@@ -153,7 +185,12 @@ class SumFilter:
             case message_protocol.internal.InternalMessageType.GAT_SUM_DATA:
                 [fruit, amount] = message.data
                 client_id = message.source_client_uuid
-                self._process_data(fruit, amount, client_id)
+                self._increment_client_inflight(client_id)
+                try:
+                    self._process_data(fruit, amount, client_id)
+                finally:
+                    self._decrement_client_inflight(client_id)
+                self._try_finalize_client(client_id)
             case message_protocol.internal.InternalMessageType.GAT_SUM_EOF:
                 client_id = message.source_client_uuid
                 self._process_eof(client_id)
@@ -164,7 +201,8 @@ class SumFilter:
         match message.type:
             case message_protocol.internal.InternalMessageType.SUM_SUM_EOF:
                 logging.info(f"Received SUM_SUM_EOF for client {message.source_client_uuid} from another sum filter")
-                self._finalize_client(message.source_client_uuid)
+                self._mark_eof_pending(message.source_client_uuid)
+                self._try_finalize_client(message.source_client_uuid)
         ack()
 
     def stop(self):
