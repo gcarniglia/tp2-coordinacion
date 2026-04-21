@@ -1,5 +1,7 @@
 import os
 import logging
+import threading
+import signal
 
 from common import middleware, message_protocol, fruit_item
 
@@ -21,20 +23,126 @@ class JoinFilter:
         self.output_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, OUTPUT_QUEUE
         )
+        self.clients_top_3 = {}
+        self.top_3_lock = threading.Lock()
+        
+        self._stop_lock = threading.Lock()
+        self._stopping = False
 
-    def process_messsage(self, message, ack, nack):
-        logging.info("Received top")
-        fruit_top = message_protocol.internal.deserialize(message)
-        self.output_queue.send(message_protocol.internal.serialize(fruit_top))
+        self._top_size = TOP_SIZE
+        
+        self._eof_count_lock = threading.Lock()
+        self._eof_count_by_client = {}
+
+    def _process_aggregation_data(self, client_id, data):
+        [fruit, amount] = data
+        new_item = fruit_item.FruitItem(fruit, int(amount))
+
+        with self.top_3_lock:
+            client_top_3 = self.clients_top_3.setdefault(client_id, [])
+            if len(client_top_3) < self._top_size or new_item > client_top_3[-1]:
+                client_top_3.append(new_item)
+                client_top_3.sort(reverse=True)
+                if len(client_top_3) > self._top_size:
+                    client_top_3.pop()
+
+    def _process_eof(self, client_id):
+        
+        with self._eof_count_lock:
+            eof_count = self._eof_count_by_client.get(client_id, 0) + 1
+            self._eof_count_by_client[client_id] = eof_count
+            if eof_count != AGGREGATION_AMOUNT:
+                return
+
+        with self.top_3_lock:
+            client_top_3 = list(self.clients_top_3.get(client_id, []))
+
+        fruit_top = [[item.fruit, item.amount] for item in client_top_3]
+        
+        self.output_queue.send(
+            message_protocol.internal.serialize(
+                message_protocol.internal.InternalMessageType.JOIN_GAT_DATA,
+                client_id,
+                fruit_top,
+            )
+        )
+        logging.info(
+            "Sent JOIN_GAT_DATA for client %s: %s", client_id, fruit_top
+        )
+
+        with self.top_3_lock:
+            self.clients_top_3.pop(client_id, None)
+        with self._eof_count_lock:
+            self._eof_count_by_client.pop(client_id, None)
+
+
+    def process_message(self, message, ack, nack):
+        
+        message = message_protocol.internal.deserialize(message)
+        match message.type:
+            case message_protocol.internal.InternalMessageType.AGG_JOIN_DATA:
+                client_id = message.source_client_uuid
+                data = message.data
+                logging.info(
+                    "Received AGG_JOIN_DATA for client %s: %s", client_id, data
+                )
+                self._process_aggregation_data(client_id, data)
+            case message_protocol.internal.InternalMessageType.AGG_JOIN_EOF:
+                client_id = message.source_client_uuid
+                logging.info("Received AGG_JOIN_EOF for client %s", client_id)
+                self._process_eof(client_id)
         ack()
 
+    def stop(self):
+        with self._stop_lock:
+            if self._stopping:
+                return
+            self._stopping = True
+
+        try:
+            self.input_queue.stop_consuming()
+        except Exception as e:
+            logging.error(f"Error stopping consumer: {e}")
+
+    def _close_resources(self):
+        resources = [self.input_queue, self.output_queue]
+
+        for resource in resources:
+            try:
+                resource.close()
+            except Exception as e:
+                logging.error(f"Error closing resource: {e}")
+
     def start(self):
-        self.input_queue.start_consuming(self.process_messsage)
+        consumer_thread = threading.Thread(
+            target=self.input_queue.start_consuming,
+            args=(self.process_message,),
+            name="agg-join-consumer-thread",
+        )
+
+        consumer_started = False
+
+        try:
+            consumer_thread.start()
+            consumer_started = True
+        except Exception:
+            self.stop()
+            raise
+        finally:
+            if consumer_started:
+                consumer_thread.join()
+            self._close_resources()
 
 
 def main():
     logging.basicConfig(level=logging.INFO)
     join_filter = JoinFilter()
+
+    def _handle_sigterm(signum, frame):
+        logging.info("SIGTERM received in join")
+        join_filter.stop()
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
     join_filter.start()
 
     return 0

@@ -24,3 +24,6 @@ docker-compose.yaml
 **/src/common/messageprotocol/external/
 **/src/common/fruit_item/
 **/src/common/fruititem/
+
+# Output
+**/output/**

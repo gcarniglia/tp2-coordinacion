@@ -1,6 +1,8 @@
 import os
 import logging
 import bisect
+import threading
+import signal
 
 from common import middleware, message_protocol, fruit_item
 
@@ -9,6 +11,7 @@ MOM_HOST = os.environ["MOM_HOST"]
 OUTPUT_QUEUE = os.environ["OUTPUT_QUEUE"]
 SUM_AMOUNT = int(os.environ["SUM_AMOUNT"])
 SUM_PREFIX = os.environ["SUM_PREFIX"]
+AGGREGATION_CONTROL_EXCHANGE = "AGGREGATION_CONTROL_EXCHANGE"
 AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
 AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
 TOP_SIZE = int(os.environ["TOP_SIZE"])
@@ -17,53 +20,167 @@ TOP_SIZE = int(os.environ["TOP_SIZE"])
 class AggregationFilter:
 
     def __init__(self):
-        self.input_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
+        self.data_sum_agg_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
             MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{ID}"]
         )
-        self.output_queue = middleware.MessageMiddlewareQueueRabbitMQ(
+
+        self.broadcast_sum_agg_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
+            MOM_HOST,
+            AGGREGATION_CONTROL_EXCHANGE,
+            [f"{AGGREGATION_PREFIX}_{ID}"],
+        )
+
+        self.agg_join_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, OUTPUT_QUEUE
         )
-        self.fruit_top = []
 
-    def _process_data(self, fruit, amount):
-        logging.info("Processing data message")
-        for i in range(len(self.fruit_top)):
-            if self.fruit_top[i].fruit == fruit:
-                self.fruit_top[i] = self.fruit_top[i] + fruit_item.FruitItem(
-                    fruit, amount
-                )
+        self.client_amounts_by_fruit = {}
+        self._amount_by_fruit_lock = threading.Lock()
+        
+        self._stop_lock = threading.Lock()
+        self._stopping = False
+
+        self._top_k_size = TOP_SIZE
+
+        self._eof_count_lock = threading.Lock()
+        self._eof_count_by_client = {}
+
+    def _process_data(self, fruit_total, amount, client_id):
+        logging.info("Received data message for client %s and fruit %s with amount %d", client_id, fruit_total, amount)
+
+        with self._amount_by_fruit_lock:
+            client_top_fruits = self.client_amounts_by_fruit.setdefault(client_id, [])
+
+            # Update existing fruit amount, otherwise keep list ordered with bisect.
+            for i in range(len(client_top_fruits)):
+                if client_top_fruits[i].fruit == fruit_total:
+                    updated_item = client_top_fruits[i] + fruit_item.FruitItem(
+                        fruit_total, amount
+                    )
+                    del client_top_fruits[i]
+                    bisect.insort(client_top_fruits, updated_item)
+                    return
+            bisect.insort(client_top_fruits, fruit_item.FruitItem(fruit_total, amount))
+
+    def _process_eof(self, client_id):
+        logging.info("Received EOF for client %s", client_id)
+
+        with self._eof_count_lock:
+            eof_count = self._eof_count_by_client.get(client_id, 0) + 1
+            self._eof_count_by_client[client_id] = eof_count
+            if eof_count != SUM_AMOUNT:
                 return
-        bisect.insort(self.fruit_top, fruit_item.FruitItem(fruit, amount))
 
-    def _process_eof(self):
-        logging.info("Received EOF")
-        fruit_chunk = list(self.fruit_top[-TOP_SIZE:])
+        with self._amount_by_fruit_lock:
+            client_top_fruits = list(self.client_amounts_by_fruit.get(client_id, []))
+
+        fruit_chunk = list(client_top_fruits[-self._top_k_size:])
         fruit_chunk.reverse()
-        fruit_top = list(
-            map(
-                lambda fruit_item: (fruit_item.fruit, fruit_item.amount),
-                fruit_chunk,
+        fruit_top = [(item.fruit, item.amount) for item in fruit_chunk]
+
+        for (fruit,amount) in fruit_top:
+            self.agg_join_queue.send(
+                message_protocol.internal.serialize(
+                    message_protocol.internal.InternalMessageType.AGG_JOIN_DATA,
+                    client_id,
+                    [fruit,amount],
+                )
+            )
+            logging.info(f"Sent AGG_JOIN_DATA message for client {client_id} and fruit {fruit} to join filter")
+
+        self.agg_join_queue.send(
+            message_protocol.internal.serialize(
+                message_protocol.internal.InternalMessageType.AGG_JOIN_EOF,
+                client_id,
+                None,
             )
         )
-        self.output_queue.send(message_protocol.internal.serialize(fruit_top))
-        del self.fruit_top
+        logging.info(f"Sent AGG_JOIN_EOF message for client {client_id} to join filter")
 
-    def process_messsage(self, message, ack, nack):
+        with self._amount_by_fruit_lock:
+            self.client_amounts_by_fruit.pop(client_id, None)
+        del self._eof_count_by_client[client_id]
+
+    def process_sum_messages(self, message, ack, nack):
         logging.info("Process message")
-        fields = message_protocol.internal.deserialize(message)
-        if len(fields) == 2:
-            self._process_data(*fields)
-        else:
-            self._process_eof()
+        message = message_protocol.internal.deserialize(message)
+        match message.type:
+            case message_protocol.internal.InternalMessageType.SUM_AGG_DATA:
+                [fruit_total, amount] = message.data
+                client_id = message.source_client_uuid
+                self._process_data(fruit_total, amount, client_id)
+            case message_protocol.internal.InternalMessageType.SUM_AGG_EOF:
+                client_id = message.source_client_uuid
+                self._process_eof(client_id)
         ack()
 
+    def stop(self):
+        with self._stop_lock:
+            if self._stopping:
+                return
+            self._stopping = True
+
+        for consumer in [self.data_sum_agg_exchange, self.broadcast_sum_agg_exchange]:
+            try:
+                consumer.stop_consuming()
+            except Exception as e:
+                logging.error(f"Error stopping consumer: {e}")
+
+    def _close_resources(self):
+        resources = [
+            self.data_sum_agg_exchange,
+            self.broadcast_sum_agg_exchange,
+            self.agg_join_queue,
+        ]
+
+        for resource in resources:
+            try:
+                resource.close()
+            except Exception as e:
+                logging.error(f"Error closing resource: {e}")
+
     def start(self):
-        self.input_exchange.start_consuming(self.process_messsage)
+        data_thread = threading.Thread(
+            target=self.data_sum_agg_exchange.start_consuming,
+            args=(self.process_sum_messages,),
+            name="sum-agg-data-consumer-thread",
+        )
+        control_thread = threading.Thread(
+            target=self.broadcast_sum_agg_exchange.start_consuming,
+            args=(self.process_sum_messages,),
+            name="sum-agg-control-consumer-thread",
+        )
+
+        data_started = False
+        control_started = False
+
+        try:
+            data_thread.start()
+            data_started = True
+            control_thread.start()
+            control_started = True
+
+        except Exception:
+            self.stop()
+            raise
+
+        finally:
+            if data_started:
+                data_thread.join()
+            if control_started:
+                control_thread.join()
+            self._close_resources()
 
 
 def main():
     logging.basicConfig(level=logging.INFO)
     aggregation_filter = AggregationFilter()
+
+    def _handle_sigterm(signum, frame):
+        logging.info("SIGTERM received in aggregation")
+        aggregation_filter.stop()
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
     aggregation_filter.start()
     return 0
 

@@ -1,5 +1,6 @@
 import os
 import logging
+import signal
 import threading
 
 from common import middleware, message_protocol, fruit_item
@@ -17,19 +18,19 @@ AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
 class SumFilter:
 
     def __init__(self):
-        self.input_queue = middleware.MessageMiddlewareQueueRabbitMQ(
+        self.gat_sum_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, INPUT_QUEUE
         )
 
-        self.data_agg_exchanges = []
+        self.data_sum_agg_exchanges = []
 
         for i in range(AGGREGATION_AMOUNT):
-            data_output_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
+            data_sum_agg_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
                 MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{i}"]
             )
-            self.data_agg_exchanges.append(data_output_exchange)
+            self.data_sum_agg_exchanges.append(data_sum_agg_exchange)
         
-        self.broadcast_agg_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
+        self.broadcast_sum_agg_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
             MOM_HOST, AGGREGATION_CONTROL_EXCHANGE, [f"{AGGREGATION_PREFIX}_{i}" for i in range(AGGREGATION_AMOUNT)]
             )
 
@@ -39,40 +40,51 @@ class SumFilter:
             [f"{SUM_PREFIX}_{i}" for i in range(SUM_AMOUNT) if i != ID]
         )
 
-        self.amount_by_fruit = {}
+        # amount_by_fruit[client_id][fruit] = FruitItem
+        self.client_amounts_by_fruit = {}
+        self._amount_by_fruit_lock = threading.Lock()
+        self._stop_lock = threading.Lock()
+        self._stopping = False
 
-    def _process_data(self, fruit, amount,client_id):
-
-        self.amount_by_fruit[(client_id, fruit)] = self.amount_by_fruit.get(
-            (client_id, fruit), fruit_item.FruitItem(fruit, 0)
-        ) + fruit_item.FruitItem(fruit, int(amount))
+    def _process_data(self, fruit, amount, client_id):
+        logging.info(f"Received data message for client {client_id} and fruit {fruit} with amount {amount}")
+        with self._amount_by_fruit_lock:
+            client_amounts = self.client_amounts_by_fruit.setdefault(client_id, {})
+            client_amounts[fruit] = client_amounts.get(
+                fruit, fruit_item.FruitItem(fruit, 0)
+            ) + fruit_item.FruitItem(fruit, int(amount))
 
 
     def _process_eof(self, client_id):
+        logging.info(f"Received EOF message for client {client_id}")
         self.sum_control_exchange.send(message_protocol.internal.serialize(message_protocol.internal.InternalMessageType.SUM_SUM_EOF, client_id, None))
+        logging.info(f"Sent SUM_SUM_EOF message for client {client_id} to other sum filters")
         self._send_to_aggregators(client_id)
+        self._flush_client_data(client_id)
+    
+    def _flush_client_data(self, client_id):
+        with self._amount_by_fruit_lock:
+            if client_id in self.client_amounts_by_fruit:
+                del self.client_amounts_by_fruit[client_id]
 
     def _send_to_aggregators(self, client_id):
+        with self._amount_by_fruit_lock:
+            client_amounts = self.client_amounts_by_fruit.get(client_id, {})
+
         logging.info(f"Broadcasting data messages")
-        for (cid, _), final_fruit_item in self.amount_by_fruit.items():
-            if cid != client_id:
-                continue
-            index = hash(client_id + final_fruit_item.fruit) % AGGREGATION_AMOUNT
-            self.data_agg_exchanges[index].send(
+        for final_fruit_item in client_amounts.values():
+            designated_agg = hash(client_id + final_fruit_item.fruit) % AGGREGATION_AMOUNT
+            self.data_sum_agg_exchanges[designated_agg].send(
                 message_protocol.internal.serialize(
                     message_protocol.internal.InternalMessageType.SUM_AGG_DATA, 
                     client_id, 
                     [final_fruit_item.fruit, final_fruit_item.amount]
                 )
             )
+            logging.info(f"Sent data message for client {client_id} and fruit {final_fruit_item.fruit} to aggregator {designated_agg}")
 
         logging.info(f"Broadcasting EOF message")
-        self.broadcast_agg_exchange.send(message_protocol.internal.serialize(message_protocol.internal.InternalMessageType.SUM_AGG_EOF, client_id, None))
-
-    def _process_shutdown(self):
-        #TODO: yo no recibo este mensaje. Lo que recibo es un cierre del 
-        # canal de rabbitmq, que es lo que me indica que no van a venir mas mensajes. Entonces, en vez de procesar un mensaje de shutdown, lo que hago es cerrar el canal y salir del programa.
-        return
+        self.broadcast_sum_agg_exchange.send(message_protocol.internal.serialize(message_protocol.internal.InternalMessageType.SUM_AGG_EOF, client_id, None))
 
 
     def process_gateway_messages(self, message, ack, nack):
@@ -94,14 +106,74 @@ class SumFilter:
                 self._send_to_aggregators(message.source_client_uuid)
         ack()
 
+    def stop(self):
+        with self._stop_lock:
+            if self._stopping:
+                return
+            self._stopping = True
+
+        for consumer in [self.gat_sum_queue, self.sum_control_exchange]:
+            try:
+                consumer.stop_consuming()
+            except Exception as e:
+                logging.error(f"Error stopping consumer: {e}")
+
+    def _close_resources(self):
+        resources = [
+            self.gat_sum_queue,
+            self.sum_control_exchange,
+            self.broadcast_sum_agg_exchange,
+            *self.data_sum_agg_exchanges,
+        ]
+
+        for resource in resources:
+            try:
+                resource.close()
+            except Exception as e:
+                logging.error(f"Error closing resource: {e}")
 
     def start(self):
-        self.input_queue.start_consuming(self.process_gateway_messages)
-        self.sum_control_exchange.start_consuming(self.process_sum_control_messages)
+        gateway_thread = threading.Thread(
+            target=self.gat_sum_queue.start_consuming,
+            args=(self.process_gateway_messages,),
+            name="gateway-consumer-thread",
+        )
+        control_thread = threading.Thread(
+            target=self.sum_control_exchange.start_consuming,
+            args=(self.process_sum_control_messages,),
+            name="sum-control-consumer-thread",
+        )
+
+        gateway_started = False
+        control_started = False
+
+        try:
+            gateway_thread.start()
+            gateway_started = True
+            control_thread.start()
+            control_started = True
+
+        except Exception:
+            self.stop()
+            raise
+
+        finally:
+            if gateway_started:
+                gateway_thread.join()
+            if control_started:
+                control_thread.join()
+            self._close_resources()
+
 
 def main():
     logging.basicConfig(level=logging.INFO)
     sum_filter = SumFilter()
+
+    def _handle_sigterm(signum, frame):
+        logging.info("SIGTERM received in sum")
+        sum_filter.stop()
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
     sum_filter.start()
     return 0
 

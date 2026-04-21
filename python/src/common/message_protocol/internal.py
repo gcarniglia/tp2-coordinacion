@@ -34,7 +34,7 @@ class InternalMessage:
     
     def _deserialize(self, data):
         msg = json.loads(data.decode("utf-8"))
-        self.type = InternalMessageType(msg["type"]) if "type" in msg else None
+        self.type = msg["type"] if "type" in msg else None
         self.source_client_uuid = msg["source_client_uuid"] if "source_client_uuid" in msg else None
         self.data = msg["data"] if "data" in msg else None
 
