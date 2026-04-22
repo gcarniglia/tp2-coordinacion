@@ -3,12 +3,14 @@ import json
 class InternalMessageType:
     GAT_SUM_DATA = 0
     GAT_SUM_EOF = 1
-    SUM_SUM_EOF = 2
-    SUM_AGG_DATA = 3
-    SUM_AGG_EOF = 4
-    AGG_JOIN_DATA = 5
-    AGG_JOIN_EOF = 6
-    JOIN_GAT_DATA = 7
+    SUM_EOF_REQ = 2
+    SUM_EOF_REP = 3
+    SUM_AGG_DATA = 4
+    SUM_AGG_EOF = 5
+    AGG_JOIN_DATA = 6
+    AGG_JOIN_EOF = 7
+    JOIN_GAT_DATA = 8
+
 
 class InternalMessage:
 

@@ -3,6 +3,7 @@ import os
 import logging
 import signal
 import threading
+from time import sleep
 
 from common import middleware, message_protocol, fruit_item
 
@@ -21,6 +22,7 @@ SUM_CONTROL_EXCHANGE = "SUM_CONTROL_EXCHANGE"
 AGGREGATION_CONTROL_EXCHANGE = "AGGREGATION_CONTROL_EXCHANGE"
 AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
 AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
+MAX_RETRY_EOF_CONSENSUS = 3
 
 class SumFilter:
 
@@ -63,9 +65,13 @@ class SumFilter:
         self._finalized_clients_lock = threading.Lock()
         self._client_eof_state_lock = threading.Lock()
         self._eof_pending_by_client = {}
-        self._inflight_by_client = {}
         self._stop_lock = threading.Lock()
         self._stopping = False
+
+        self.total_lines_counter_by_client = {}
+        self.lines_processed_in_this_sum_from_gateway_by_client = {}
+        self.lines_processed_from_other_sums_by_client = {}
+        self.tries_processed_from_other_sums_by_client = {}
 
     def _mark_client_finalized(self, client_id):
         with self._finalized_clients_lock:
@@ -74,37 +80,9 @@ class SumFilter:
             self._finalized_clients.add(client_id)
             return True
 
-    def _mark_eof_pending(self, client_id):
-        with self._client_eof_state_lock:
-            self._eof_pending_by_client[client_id] = True
-
-    def _increment_client_inflight(self, client_id):
-        with self._client_eof_state_lock:
-            current = self._inflight_by_client.get(client_id, 0)
-            self._inflight_by_client[client_id] = current + 1
-
-    def _decrement_client_inflight(self, client_id):
-        with self._client_eof_state_lock:
-            current = self._inflight_by_client.get(client_id, 0)
-            if current <= 1:
-                self._inflight_by_client.pop(client_id, None)
-                return
-            self._inflight_by_client[client_id] = current - 1
-
-    def _try_finalize_client(self, client_id):
-        with self._client_eof_state_lock:
-            if not self._eof_pending_by_client.get(client_id, False):
-                return
-            if self._inflight_by_client.get(client_id, 0) != 0:
-                return
-            self._eof_pending_by_client.pop(client_id, None)
-            self._inflight_by_client.pop(client_id, None)
-
-        self._finalize_client(client_id)
-
     def _finalize_client(self, client_id):
+        logging.info(f"Finalizing client {client_id}")
         if not self._mark_client_finalized(client_id):
-            logging.info(f"Client {client_id} was already finalized")
             return
         self._send_to_aggregators(client_id)
         self._flush_client_data(client_id)
@@ -116,22 +94,87 @@ class SumFilter:
             client_amounts[fruit] = client_amounts.get(
                 fruit, fruit_item.FruitItem(fruit, 0)
             ) + fruit_item.FruitItem(fruit, int(amount))
+            self.lines_processed_in_this_sum_from_gateway_by_client[client_id] = self.lines_processed_in_this_sum_from_gateway_by_client.get(client_id, 0) + 1
 
 
-    def _process_eof(self, client_id):
+    def _process_gateway_eof(self, client_id, total_lines):
         logging.info(f"Received GAT_SUM_EOF for client {client_id}")
-        
-        if SUM_AMOUNT > 1 and self.sum_control_producer_exchange is not None:
-            self.sum_control_producer_exchange.send(message_protocol.internal.serialize(message_protocol.internal.InternalMessageType.SUM_SUM_EOF, client_id, None))
-            logging.info(f"Sent SUM_SUM_EOF for client {client_id} to other sum filters")
 
-        self._mark_eof_pending(client_id)
-        self._try_finalize_client(client_id)
-    
+        if SUM_AMOUNT > 1 and self.sum_control_producer_exchange is not None:
+            self.total_lines_counter_by_client[client_id] = total_lines
+            data = {
+                "source_index": ID,
+                "total_lines": total_lines,
+                "lines_processed": self.lines_processed_in_this_sum_from_gateway_by_client.get(client_id, 0)
+            }
+            self.sum_control_producer_exchange.send(message_protocol.internal.serialize(message_protocol.internal.InternalMessageType.SUM_EOF_REQ, client_id, data))
+            logging.info(f"Sent SUM_EOF_REQ for client {client_id} to other sum filters")
+        else:
+            self._finalize_client(client_id)
+
+    def _process_eof_request(self, client_id, source_index, total_lines, lines_processed):
+        self.total_lines_counter_by_client[client_id] = total_lines
+        self.lines_processed_from_other_sums_by_client.setdefault(client_id, {})
+        self.lines_processed_from_other_sums_by_client[client_id][str(source_index)] = lines_processed
+        with self._amount_by_fruit_lock:
+            lines_processed_in_this_sum = self.lines_processed_in_this_sum_from_gateway_by_client.get(client_id, 0)
+        self.sum_control_producer_exchange.send(message_protocol.internal.serialize(message_protocol.internal.InternalMessageType.SUM_EOF_REP, client_id, {"source_index": ID, "lines_processed": lines_processed_in_this_sum}))
+
+    def _process_eof_response(self, client_id, source_index, lines_processed):
+
+        if client_id in self._finalized_clients:
+            return
+
+        self.lines_processed_from_other_sums_by_client.setdefault(client_id, {})
+        self.lines_processed_from_other_sums_by_client[client_id][str(source_index)] = lines_processed
+
+        if len(self.lines_processed_from_other_sums_by_client[client_id]) + 1 != SUM_AMOUNT:  # +1 por sum de este worker
+            return
+
+        if self._eof_consensus_achieved(client_id):
+            logging.info(f"EOF consensus achieved for client {client_id}")
+            logging.info(f"Total lines for client {client_id}: {self.total_lines_counter_by_client[client_id]}. Lines processed in this sum: {self.lines_processed_in_this_sum_from_gateway_by_client.get(client_id, 0)}. Lines processed from other sums: {self.lines_processed_from_other_sums_by_client.get(client_id, {})}")
+            self._finalize_client(client_id)
+        else:
+            logging.info(f"EOF consensus not yet achieved for client {client_id}. Waiting for more responses.")
+            logging.info(f"Total lines for client {client_id}: {self.total_lines_counter_by_client[client_id]}. Lines processed in this sum: {self.lines_processed_in_this_sum_from_gateway_by_client.get(client_id, 0)}. Lines processed from other sums: {self.lines_processed_from_other_sums_by_client.get(client_id, {})}")
+            self.tries_processed_from_other_sums_by_client[client_id] = self.tries_processed_from_other_sums_by_client.get(client_id, 0) + 1
+            self._retry_eof_consensus(client_id)
+
+    def _retry_eof_consensus(self, client_id):
+        tries = self.tries_processed_from_other_sums_by_client[client_id]
+        sleep((tries+1) * 0.4)  # Exponential backoff
+        if tries > MAX_RETRY_EOF_CONSENSUS:
+            logging.warning(f"Max retries for EOF consensus exceeded for client {client_id}. Forcing finalization. This system is not failure-tolerant")
+            self._finalize_client(client_id)
+        else:
+            logging.info(f"Retrying EOF consensus for client {client_id}. Attempt {tries+1}")
+            with self._amount_by_fruit_lock:
+                lines_processed_in_this_sum = self.lines_processed_in_this_sum_from_gateway_by_client.get(client_id, 0)
+            self.sum_control_producer_exchange.send(message_protocol.internal.serialize(message_protocol.internal.InternalMessageType.SUM_EOF_REQ, client_id, {"source_index": ID, "total_lines": self.total_lines_counter_by_client[client_id], "lines_processed": lines_processed_in_this_sum}))
+
+    def _eof_consensus_achieved(self, client_id):
+        total_lines = self.total_lines_counter_by_client.get(client_id)
+        if total_lines is None:
+            return False
+        with self._amount_by_fruit_lock:
+            lines_processed_in_this_sum = self.lines_processed_in_this_sum_from_gateway_by_client.get(client_id, 0)
+        lines_processed_from_other_sums = self.lines_processed_from_other_sums_by_client.get(client_id, {})
+        total_reported = lines_processed_in_this_sum + sum(lines_processed_from_other_sums.values())
+        return total_reported == total_lines
+
     def _flush_client_data(self, client_id):
         with self._amount_by_fruit_lock:
             if client_id in self.client_amounts_by_fruit:
                 del self.client_amounts_by_fruit[client_id]
+            if client_id in self.total_lines_counter_by_client:
+                del self.total_lines_counter_by_client[client_id]
+            if client_id in self.lines_processed_in_this_sum_from_gateway_by_client:
+                del self.lines_processed_in_this_sum_from_gateway_by_client[client_id]
+            if client_id in self.lines_processed_from_other_sums_by_client:
+                del self.lines_processed_from_other_sums_by_client[client_id]
+            if client_id in self.tries_processed_from_other_sums_by_client:
+                del self.tries_processed_from_other_sums_by_client[client_id]
 
     def _send_to_aggregators(self, client_id):
         with self._amount_by_fruit_lock:
@@ -178,6 +221,12 @@ class SumFilter:
                 )
             )
 
+    def _try_finalize_client(self, client_id):
+        with self._client_eof_state_lock:
+            eof_pending = self._eof_pending_by_client.get(client_id, False)
+
+        if eof_pending:
+            self._finalize_client(client_id)
 
     def process_gateway_messages(self, message, ack, nack):
         message = message_protocol.internal.deserialize(message)
@@ -185,24 +234,22 @@ class SumFilter:
             case message_protocol.internal.InternalMessageType.GAT_SUM_DATA:
                 [fruit, amount] = message.data
                 client_id = message.source_client_uuid
-                self._increment_client_inflight(client_id)
-                try:
-                    self._process_data(fruit, amount, client_id)
-                finally:
-                    self._decrement_client_inflight(client_id)
+                self._process_data(fruit, amount, client_id)
                 self._try_finalize_client(client_id)
             case message_protocol.internal.InternalMessageType.GAT_SUM_EOF:
                 client_id = message.source_client_uuid
-                self._process_eof(client_id)
+                self._process_gateway_eof(client_id,message.data)
         ack()
 
     def process_sum_control_messages(self, message, ack, nack):
         message = message_protocol.internal.deserialize(message)
         match message.type:
-            case message_protocol.internal.InternalMessageType.SUM_SUM_EOF:
-                logging.info(f"Received SUM_SUM_EOF for client {message.source_client_uuid} from another sum filter")
-                self._mark_eof_pending(message.source_client_uuid)
-                self._try_finalize_client(message.source_client_uuid)
+            case message_protocol.internal.InternalMessageType.SUM_EOF_REQ:
+                logging.info(f"Received SUM_EOF_REQ for client {message.source_client_uuid} from sum filter index {message.data['source_index']}")
+                self._process_eof_request(message.source_client_uuid, message.data["source_index"], message.data["total_lines"], message.data["lines_processed"])
+            case message_protocol.internal.InternalMessageType.SUM_EOF_REP:
+                logging.info(f"Received SUM_EOF_REP for client {message.source_client_uuid} from sum filter index {message.data['source_index']}")
+                self._process_eof_response(message.source_client_uuid, message.data["source_index"], message.data["lines_processed"])
         ack()
 
     def stop(self):
@@ -260,7 +307,7 @@ class SumFilter:
 
         except Exception:
             self.stop()
-            raise
+            return -1
 
         finally:
             if gateway_started:
@@ -268,6 +315,7 @@ class SumFilter:
             if control_started:
                 control_thread.join()
             self._close_resources()
+            return 0
 
 
 def main():
@@ -280,7 +328,6 @@ def main():
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
     sum_filter.start()
-    return 0
 
 
 if __name__ == "__main__":
