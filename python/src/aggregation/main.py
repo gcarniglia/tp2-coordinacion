@@ -33,6 +33,9 @@ class AggregationFilter:
             MOM_HOST, OUTPUT_QUEUE
         )
 
+        self._sigterm_received = False
+        self._runtime_error = False
+
         self.client_amounts_by_fruit = {}
         self._amount_by_fruit_lock = threading.Lock()
         
@@ -43,6 +46,20 @@ class AggregationFilter:
 
         self._eof_count_lock = threading.Lock()
         self._eof_count_by_client = {}
+
+    def notify_sigterm(self):
+        self._sigterm_received = True
+        self.stop()
+
+    def _run_sum_consumer(self):
+        try:
+            self.data_sum_agg_exchange.start_consuming(self.process_sum_messages)
+        except Exception as e:
+            logging.error(f"SUM->AGG consumer crashed: {e}")
+            with self._stop_lock:
+                if not self._stopping:
+                    self._runtime_error = True
+            self.stop()
 
     def _process_data(self, fruit_total, amount, client_id):
         logging.info("Received SUM_AGG_DATA for client %s and fruit %s with amount %d", client_id, fruit_total, amount)
@@ -138,8 +155,7 @@ class AggregationFilter:
 
     def start(self):
         data_thread = threading.Thread(
-            target=self.data_sum_agg_exchange.start_consuming,
-            args=(self.process_sum_messages,),
+            target=self._run_sum_consumer,
             name="sum-agg-data-consumer-thread",
         )
 
@@ -148,15 +164,21 @@ class AggregationFilter:
         try:
             data_thread.start()
             data_started = True
-
-        except Exception:
+        except Exception as e:
             self.stop()
-            raise
-
-        finally:
-            if data_started:
-                data_thread.join()
+            logging.error(e)
             self._close_resources()
+            return 2
+
+        if data_started:
+            data_thread.join()
+
+        self._close_resources()
+
+        if self._runtime_error and not self._sigterm_received:
+            return 1
+
+        return 0
 
 
 def main():
@@ -165,11 +187,10 @@ def main():
 
     def _handle_sigterm(signum, frame):
         logging.info("SIGTERM received in aggregation")
-        aggregation_filter.stop()
+        aggregation_filter.notify_sigterm()
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
-    aggregation_filter.start()
-    return 0
+    return aggregation_filter.start()
 
 
 if __name__ == "__main__":

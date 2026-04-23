@@ -29,6 +29,9 @@ class JoinFilter:
         self.output_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, OUTPUT_QUEUE
         )
+        self._sigterm_received = False
+        self._runtime_error = False
+
         self.clients_top_3 = {}
         self.top_3_lock = threading.Lock()
         
@@ -39,6 +42,20 @@ class JoinFilter:
         
         self._eof_count_lock = threading.Lock()
         self._eof_count_by_client = {}
+    
+    def _run_consumer(self):
+        try:
+            self.input_queue.start_consuming(self.process_message)
+        except Exception as e:
+            logging.error(f"Join consumer crashed: {e}")
+            with self._stop_lock:
+                if not self._stopping:
+                    self._runtime_error = True
+            self.stop()
+    
+    def notify_sigterm(self):
+        self._sigterm_received = True
+        self.stop()
 
     def _process_aggregation_data(self, client_id, data):
         [fruit, amount] = data
@@ -121,9 +138,8 @@ class JoinFilter:
 
     def start(self):
         consumer_thread = threading.Thread(
-            target=self.input_queue.start_consuming,
-            args=(self.process_message,),
-            name="agg-join-consumer-thread",
+            target=self._run_consumer,
+            name="join-consumer-thread",
         )
 
         consumer_started = False
@@ -131,13 +147,21 @@ class JoinFilter:
         try:
             consumer_thread.start()
             consumer_started = True
-        except Exception:
+        except Exception as e:
+            logging.error(e)
             self.stop()
-            raise
-        finally:
-            if consumer_started:
-                consumer_thread.join()
             self._close_resources()
+            return 2
+
+        if consumer_started:
+            consumer_thread.join()
+
+        self._close_resources()
+
+        if self._runtime_error and not self._sigterm_received:
+            return 1
+
+        return 0
 
 
 def main():
@@ -146,12 +170,11 @@ def main():
 
     def _handle_sigterm(signum, frame):
         logging.info("SIGTERM received in join")
-        join_filter.stop()
+        join_filter.notify_sigterm()
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
-    join_filter.start()
 
-    return 0
+    return join_filter.start()
 
 
 if __name__ == "__main__":

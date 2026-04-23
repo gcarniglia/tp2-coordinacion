@@ -2,7 +2,7 @@ import pika
 from .middleware import MessageMiddlewareCloseError, MessageMiddlewareDisconnectedError, MessageMiddlewareMessageError, MessageMiddlewareQueue, MessageMiddlewareExchange
 
 # Cantidad maxima de mensajes sin ack entregados al consumidor al mismo tiempo.
-MAX_UNACKED_MESSAGES = 1
+MAX_UNACKED_MESSAGES = 100
 
 class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
 
