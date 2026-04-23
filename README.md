@@ -71,8 +71,8 @@ En lo que refiere al diseño de robustez, se mantuvo el diseño original. El ún
 
 ## Presuposiciones de la solución
 
-- Un cliente envía una única petición. Se dejó de esa forma. No es complicada la modificación, pero la solución actual no requería resolver esa cuestión.
-- En la capa de sincronización se envía un mensaje SUM_SUM_EOF desde un sum al resto para indicar que un determinado cliente finalizó su envío de datos. Se asume que prefetch_count = 1 en el middleware, lo cual garantiza que haya como máximo un único mensaje en procesamiento por worker.
+- Un cliente envía una única petición. Se dejó de esa forma. No es complicada la modificación, pero la solución actual no requería resolver esa cuestión en específico.
+- En la capa de sincronización... 
 - Una vez que se recibe uno de los mensajes de EOF (según el worker que corresponda), dicha instancia pasará a limpiar los datos de ese cliente. No se guarda en memoria nada que no sea estrictamente aquello que se está procesando.
 - Una mejora posible sería agregar persistencia en archivos para guardar los datos. No se implementó, pero se consideró.
 
@@ -80,6 +80,7 @@ En lo que refiere al diseño de robustez, se mantuvo el diseño original. El ún
 
 ## Consideraciones
 
-- Para asegurar de manera determinista que una fruta de un cliente específico vaya siempre al mismo aggregator, se utilizó hashlib para generar un valor que permita particionar la relación cliente-fruta hacia un aggregator determinado. Inicialmente se utilizó hash() de Python, pero se descartó por no ser determinista (mismos datos iban a diferentes aggregators).
+- Para asegurar de manera determinista que una fruta de un cliente específico vaya siempre al mismo aggregator, y para a su vez garantizar una distribución no privilegiada hacia ninguna instancia específica, se utilizó hashlib para generar un valor que permita particionar la relación cliente-fruta hacia un aggregator determinado. Inicialmente se utilizó hash() de Python, pero se descartó por no ser determinista (mismos datos iban a diferentes aggregators).
 
-- Ya sea que se reciba GAT_SUM_EOF o SUM_SUM_EOF, la capa de sincronización solo finalizará cuando no haya en proceso ningún otro mensaje GAT_SUM_DATA asociado a ese cliente. Podría ocurrir que se haga flush de la información de un cliente al recibir SUM_SUM_EOF sin haber terminado de procesar un GAT_SUM_DATA. Para evitar este escenario se utiliza una variable inflight_by_client que guarda la cantidad de mensajes en procesamiento. Al recibir EOF se marca eof_by_client[client] = True. Luego, si no quedan mensajes en procesamiento, se finaliza y comienza el envío de datos al aggregator.
+- Ya sea que se reciba GAT_SUM_EOF o SUM_SUM_EOF, la capa de sincronización solo finalizará cuando no haya en proceso ningún otro mensaje GAT_SUM_DATA asociado a ese cliente. Podría ocurrir que se haga flush de la información de un cliente al recibir SUM_SUM_EOF sin haber terminado de procesar un GAT_SUM_DATA. Para evitar este escenario se utiliza una variable inflight_by_client que guarda la cantidad de mensajes en procesamiento. Al recibir EOF se marca eof_by_client[client] = True. Luego, si no quedan mensajes en procesamiento, se finaliza y comienza el envío de datos al aggregator...s
+- 

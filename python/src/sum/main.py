@@ -43,6 +43,10 @@ class SumFilter:
 
         self.sum_control_consumer_exchange = None
         self.sum_control_producer_exchange = None
+
+        self._sigterm_received = False
+        self._runtime_error = False
+
         if SUM_AMOUNT > 1:
             # Consume only messages addressed to this sum instance.
             self.sum_control_consumer_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
@@ -72,6 +76,27 @@ class SumFilter:
         self.lines_processed_in_this_sum_from_gateway_by_client = {}
         self.lines_processed_from_other_sums_by_client = {}
         self.tries_processed_from_other_sums_by_client = {}
+
+    def notify_sigterm(self):
+        self._sigterm_received = True
+        self.stop()
+
+    def _handle_runtime_failure(self, error, context):
+        logging.error(f"{context}: {error}")
+        self._runtime_error = True
+        self.stop()
+
+    def _run_gateway_consumer(self):
+        try:
+            self.gat_sum_queue.start_consuming(self.process_gateway_messages)
+        except Exception as e:
+            self._handle_runtime_failure(e, "Gateway consumer crashed")
+
+    def _run_control_consumer(self):
+        try:
+            self.sum_control_consumer_exchange.start_consuming(self.process_sum_control_messages)
+        except Exception as e:
+            self._handle_runtime_failure(e, "Control consumer crashed")
 
     def _mark_client_finalized(self, client_id):
         with self._finalized_clients_lock:
@@ -283,15 +308,13 @@ class SumFilter:
 
     def start(self):
         gateway_thread = threading.Thread(
-            target=self.gat_sum_queue.start_consuming,
-            args=(self.process_gateway_messages,),
-            name="gateway-consumer-thread",
+        target=self._run_gateway_consumer,
+        name="gateway-consumer-thread",
         )
         control_thread = None
         if SUM_AMOUNT > 1:
             control_thread = threading.Thread(
-                target=self.sum_control_consumer_exchange.start_consuming,
-                args=(self.process_sum_control_messages,),
+                target=self._run_control_consumer,
                 name="sum-control-consumer-thread",
             )
 
@@ -305,17 +328,23 @@ class SumFilter:
                 control_thread.start()
                 control_started = True
 
-        except Exception:
+        except Exception as e:
+            logging.error(e)
             self.stop()
-            return -1
-
-        finally:
-            if gateway_started:
-                gateway_thread.join()
-            if control_started:
-                control_thread.join()
             self._close_resources()
-            return 0
+            return 2
+
+        if gateway_started:
+            gateway_thread.join()
+        if control_started:
+            control_thread.join()
+
+        self._close_resources()
+
+        if self._runtime_error and not self._sigterm_received:
+            return 1
+
+        return 0
 
 
 def main():
@@ -324,10 +353,10 @@ def main():
 
     def _handle_sigterm(signum, frame):
         logging.info("SIGTERM received in sum")
-        sum_filter.stop()
+        sum_filter.notify_sigterm()
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
-    sum_filter.start()
+    return sum_filter.start()
 
 
 if __name__ == "__main__":
